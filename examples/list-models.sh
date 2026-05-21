@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-CONFIG="${HERMES_CONFIG:-$HOME/.config/hermes-claude/config}"
+CONFIG="${HERMES_CONFIG:-$HOME/.config/9r-claude/config}"
 [ -f "$CONFIG" ] || { echo "config not found: $CONFIG" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$CONFIG"

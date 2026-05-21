@@ -240,7 +240,7 @@ def main():
     print(f"turns extracted: {len(turns)}, last {args.last} kept verbatim")
     print(f"session: {sid}")
     print(f"file:    {out}")
-    print(f"\nresume:  cd {args.cwd} && hermes-claude --resume {sid}")
+    print(f"\nresume:  cd {args.cwd} && 9r-claude --resume {sid}")
     return 0
 
 

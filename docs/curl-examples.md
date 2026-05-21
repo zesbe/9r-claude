@@ -226,7 +226,7 @@ Banyak endpoint terima dua header sekaligus:
 -H "Authorization: Bearer $KEY"
 ```
 
-9router & sebagian besar proxy Anthropic-compat support keduanya. `hermes-claude` pakai `ANTHROPIC_AUTH_TOKEN` yang nge-generate `Authorization: Bearer` header.
+9router & sebagian besar proxy Anthropic-compat support keduanya. `9r-claude` pakai `ANTHROPIC_AUTH_TOKEN` yang nge-generate `Authorization: Bearer` header.
 
 ## Common Errors
 

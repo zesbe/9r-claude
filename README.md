@@ -24,14 +24,14 @@ Bonus: tools buat handle long sessions (auto-compact Kiro, import sesi Kiro ke C
 **One-liner (paling cepat):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zesbe/hermes-claude/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zesbe/9r-claude/main/scripts/install.sh | bash
 ```
 
 **Atau clone + make:**
 
 ```bash
-git clone https://github.com/zesbe/hermes-claude.git
-cd hermes-claude
+git clone https://github.com/zesbe/9r-claude.git
+cd 9r-claude
 make install              # install ke ~/.local/bin
 ```
 

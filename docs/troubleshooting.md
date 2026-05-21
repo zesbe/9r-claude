@@ -1,23 +1,23 @@
 # Troubleshooting
 
-Daftar masalah yang sering ketemu pas pakai `hermes-claude` + cara fix-nya.
+Daftar masalah yang sering ketemu pas pakai `9r-claude` + cara fix-nya.
 
 ## Setup & Config
 
-### "config belum lengkap. Jalankan: hermes-claude config"
+### "config belum lengkap. Jalankan: 9r-claude config"
 
 Belum jalanin wizard. Run:
 
 ```bash
-hermes-claude config
+9r-claude config
 ```
 
 Atau set manual:
 
 ```bash
-hermes-claude set-endpoint "https://9r.zesbe.my.id"
-hermes-claude set-key "sk-..."
-hermes-claude set-model "kr/claude-opus-4.7-thinking"
+9r-claude set-endpoint "https://9r.zesbe.my.id"
+9r-claude set-key "sk-..."
+9r-claude set-model "kr/claude-opus-4.7-thinking"
 ```
 
 ### "binary 'claude' (Claude Code CLI) tidak ditemukan di PATH"
@@ -36,35 +36,35 @@ claude --version
 ### Config file kemana?
 
 ```
-~/.config/hermes-claude/config        # default
-$XDG_CONFIG_HOME/hermes-claude/config # kalau XDG_CONFIG_HOME ke-set
+~/.config/9r-claude/config        # default
+$XDG_CONFIG_HOME/9r-claude/config # kalau XDG_CONFIG_HOME ke-set
 ```
 
 Edit langsung kalau perlu:
 
 ```bash
-hermes-claude edit
+9r-claude edit
 # atau
-$EDITOR ~/.config/hermes-claude/config
+$EDITOR ~/.config/9r-claude/config
 ```
 
 ## Connection & Auth
 
-### HTTP 200 dari `hermes-claude test` tapi error pas chat
+### HTTP 200 dari `9r-claude test` tapi error pas chat
 
 Biasanya satu dari tiga ini:
 
-1. **Model `/model` picker override**. Liat banner Claude Code — kalau di pojok ada "Opus 4" (bukan "Opus 4.7"), berarti picker udah override. Keluar Claude, run `hermes-claude pick-model`, terus masuk lagi tanpa nyentuh `/model`.
+1. **Model `/model` picker override**. Liat banner Claude Code — kalau di pojok ada "Opus 4" (bukan "Opus 4.7"), berarti picker udah override. Keluar Claude, run `9r-claude pick-model`, terus masuk lagi tanpa nyentuh `/model`.
 
 2. **Trailing slash di endpoint**. Wrapper auto-strip, tapi kalau lo edit config manual mungkin nyelip. Cek:
    ```bash
-   hermes-claude show
+   9r-claude show
    # endpoint harus tanpa trailing / atau /v1
    ```
 
 3. **API key expired / di-rotate**. Test ulang:
    ```bash
-   hermes-claude test
+   9r-claude test
    ```
 
 ### "API Error: 400 Invalid JSON body"
@@ -79,7 +79,7 @@ Beberapa penyebab:
 
 - **Token over limit**: total context window kelewat (~1M token untuk Opus 4.7). Kalau import sesi panjang, pake `kiro2claude-summary` yang truncate ke ~500k token.
 - **Orphan tool_use**: turn assistant punya tool_use tanpa tool_result match-nya. `kiro2claude-summary` auto-pad. Kalau sesi asli Claude yang error, biasanya hasil interrupt — start sesi baru.
-- **Model gak dikenal**: cek `hermes-claude models` apakah model di config ada di list endpoint.
+- **Model gak dikenal**: cek `9r-claude models` apakah model di config ada di list endpoint.
 
 ### "[400]: ... (reset after Xs)" atau "[403]: ... (reset after Xs)"
 
@@ -88,7 +88,7 @@ Itu **rate limit**, bukan format error. Tunggu sesuai countdown (`reset after 1m
 Verifikasi:
 
 ```bash
-sleep 60 && hermes-claude test
+sleep 60 && 9r-claude test
 ```
 
 Kalau abis sleep 200 (HTTP), berarti emang rate limit. Pertimbangin upgrade tier endpoint atau spread request lewat 2-3 proxy.
@@ -98,14 +98,14 @@ Kalau abis sleep 200 (HTTP), berarti emang rate limit. Pertimbangin upgrade tier
 API key gak ke-kirim atau salah. Cek:
 
 ```bash
-hermes-claude show           # api key harus muncul (di-mask)
-cat ~/.config/hermes-claude/config | grep KEY
+9r-claude show           # api key harus muncul (di-mask)
+cat ~/.config/9r-claude/config | grep KEY
 ```
 
 Kalau key di config keisi nilai masked (`sk-5d1...a61f`), lo nge-paste output dari `show`, bukan key asli. Set ulang:
 
 ```bash
-hermes-claude set-key "sk-real-key-here"
+9r-claude set-key "sk-real-key-here"
 ```
 
 ## Model Selection
@@ -117,7 +117,7 @@ Picker bawaan Claude Code map ke `ANTHROPIC_DEFAULT_OPUS_MODEL`. Kalau env var i
 Fix: pastiin per-tier env vars ke-export oleh wrapper. Jalanin:
 
 ```bash
-HERMES_VERBOSE=1 hermes-claude
+HERMES_VERBOSE=1 9r-claude
 # Liat output sebelum claude jalan, harus ada:
 # ==> opus model:  kr/claude-opus-4.7-thinking
 # ==> sonnet:      kr/claude-sonnet-4.6-thinking
@@ -127,7 +127,7 @@ HERMES_VERBOSE=1 hermes-claude
 Kalau kosong / salah, edit config:
 
 ```bash
-hermes-claude edit
+9r-claude edit
 # tambahin / fix:
 HERMES_OPUS_MODEL="kr/claude-opus-4.7-thinking"
 HERMES_SONNET_MODEL="kr/claude-sonnet-4.6-thinking"
@@ -141,8 +141,8 @@ Susah — `ANTHROPIC_MODEL` di-bake ke env saat launch. Kalau lo butuh switch mo
 Kalau mau ganti model di tier yang sama (misalnya Opus thinking → Opus thinking-agentic), keluar Claude:
 
 ```bash
-hermes-claude pick-model
-hermes-claude
+9r-claude pick-model
+9r-claude
 ```
 
 ## Session Management
@@ -161,7 +161,7 @@ ls ~/.claude/projects/-home-zesbe/
 Resume:
 
 ```bash
-hermes-claude --resume <filename-without-jsonl>
+9r-claude --resume <filename-without-jsonl>
 ```
 
 ### Banyak sesi pendek `/model` `/exit` di picker
@@ -189,7 +189,7 @@ Atau migrate ke Claude Code permanen:
 
 ```bash
 kiro2claude-summary ~/.kiro/sessions/cli/<id>.jsonl --cwd ~ --last 30
-hermes-claude --resume <session-id-from-output>
+9r-claude --resume <session-id-from-output>
 ```
 
 ## Performance
@@ -208,7 +208,7 @@ hermes-claude --resume <session-id-from-output>
 `ANTHROPIC_SMALL_FAST_MODEL` default ke Haiku — kalau Haiku gak available di endpoint, set ke model yang ada:
 
 ```bash
-hermes-claude edit
+9r-claude edit
 # tambah baris:
 HERMES_HAIKU_MODEL="kr/claude-sonnet-4.6"  # fallback ke sonnet
 ```
@@ -218,26 +218,26 @@ HERMES_HAIKU_MODEL="kr/claude-sonnet-4.6"  # fallback ke sonnet
 Kalau semua udah kacau dan mau mulai dari nol:
 
 ```bash
-hermes-claude reset                         # hapus config hermes-claude
+9r-claude reset                         # hapus config 9r-claude
 rm -rf ~/.claude/projects/                  # hapus semua sesi Claude (HATI-HATI)
-hermes-claude config                        # setup ulang
+9r-claude config                        # setup ulang
 ```
 
 ## Debug Mode
 
 ```bash
-HERMES_VERBOSE=1 hermes-claude              # print info wrapper
-ANTHROPIC_LOG=debug hermes-claude           # claude debug logs
+HERMES_VERBOSE=1 9r-claude              # print info wrapper
+ANTHROPIC_LOG=debug 9r-claude           # claude debug logs
 ```
 
 Kalau masih bingung, capture full request:
 
 ```bash
-HERMES_VERBOSE=1 hermes-claude -p "test" 2>&1 | tee /tmp/debug.log
+HERMES_VERBOSE=1 9r-claude -p "test" 2>&1 | tee /tmp/debug.log
 ```
 
 Ada error gak ke-cover di sini? Buka issue di GitHub repo dengan:
 
-- Output `hermes-claude show` (key di-mask, jangan paste yang asli)
-- Output `hermes-claude test`
+- Output `9r-claude show` (key di-mask, jangan paste yang asli)
+- Output `9r-claude test`
 - Error message persis (copy-paste, jangan re-type)

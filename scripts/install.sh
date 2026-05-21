@@ -2,14 +2,14 @@
 # install.sh — one-liner installer untuk 9r-claude
 #
 # Quick install:
-#   curl -fsSL https://raw.githubusercontent.com/zesbe/hermes-claude/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/zesbe/9r-claude/main/scripts/install.sh | bash
 #
 # Custom prefix:
 #   curl -fsSL .../install.sh | PREFIX=$HOME/.local bash
 
 set -euo pipefail
 
-REPO="${REPO:-zesbe/hermes-claude}"
+REPO="${REPO:-zesbe/9r-claude}"
 BRANCH="${BRANCH:-main}"
 PREFIX="${PREFIX:-$HOME/.local}"
 BINDIR="$PREFIX/bin"
