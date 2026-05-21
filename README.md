@@ -15,10 +15,18 @@ Bonus: tools buat handle long sessions (auto-compact Kiro, import sesi Kiro ke C
 
 ## Install
 
+**One-liner (paling cepat):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zesbe/hermes-claude/main/scripts/install.sh | bash
+```
+
+**Atau clone + make:**
+
 ```bash
 git clone https://github.com/zesbe/hermes-claude.git
 cd hermes-claude
-make install              # symlinks ke ~/.local/bin
+make install              # install ke ~/.local/bin
 ```
 
 Manual install (kalau gak mau pakai make):
