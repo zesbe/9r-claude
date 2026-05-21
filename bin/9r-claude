@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+# 9r-claude — Claude Code CLI wrapper for 9router / Hermes endpoints.
+#
+# Pertama kali jalan: tanya endpoint + API key + default model, simpan
+# di ~/.config/9r-claude/config. Jalan berikutnya tinggal `9r-claude`
+# atau `9r-claude <args>` — semua arg di-pass ke `claude`.
+#
+# YOLO mode (auto-accept semua permission Claude Code) — DEFAULT ON sejak v0.4.
+# `9r-claude` aja sudah ekuivalen dengan `9r-claude -y`. Mau matikan:
+#   9r-claude --no-yolo                sekali jalan tanpa bypass
+#   9r-claude yolo off                 disable yolo permanen di config
+#   HERMES_YOLO=0 9r-claude            disable lewat env (sekali jalan)
+# Flag `-y` / `--yolo` masih ada untuk eksplisit/script, walau redundant.
+#
+# Subcommands:
+#   9r-claude show                 lihat config aktif (key dimask)
+#   9r-claude config               wizard interaktif (endpoint+key+model picker)
+#   9r-claude models               list model dari endpoint
+#   9r-claude pick-model           switch model via picker (fzf / nomor)
+#   9r-claude set-endpoint <url>   ganti base URL (cth: https://9r.zesbe.my.id)
+#   9r-claude set-key <key>        ganti API key
+#   9r-claude set-model [model]    ganti model (kosong = picker)
+#   9r-claude yolo on|off          toggle bypass mode permanen
+#   9r-claude test                 ping endpoint, verify auth
+#   9r-claude reset                hapus config (mulai dari nol)
+#   9r-claude -- <args>            pass-through ke claude (eksplisit)
+#
+# Catatan kompatibilitas:
+#   - Symlink `hermes-claude` masih jalan dan ngarah ke binary ini.
+#   - Config lama di ~/.config/hermes-claude di-migrate otomatis sekali.
+
+VERSION="0.4.0"
+
+usage() {
+  cat <<'USAGE'
+9r-claude — wrapper Claude Code CLI untuk endpoint custom (9router/Hermes/dll)
+
+USAGE:
+  9r-claude                       launch claude pakai config aktif
+  9r-claude <args>                launch claude + pass-through args
+  9r-claude -- <args>             eksplisit pass-through (kalo arg bentrok)
+  9r-claude -y / --yolo           auto-accept semua permission (sekali jalan)
+
+CONFIG (one-time setup):
+  9r-claude config                wizard interaktif (endpoint+key+model)
+  9r-claude reset                 hapus config (confirm dulu)
+
+VIEW:
+  9r-claude show                  lihat config aktif (key dimask)
+  9r-claude models                list semua model di endpoint
+  9r-claude version               versi wrapper
+
+EDIT:
+  9r-claude set-endpoint <url>    ganti base URL (mis. https://9r.zesbe.my.id
+                                  atau http://127.0.0.1:20128)
+  9r-claude set-key <key>         ganti API key (sk-...)
+  9r-claude set-model [model]     ganti model default (kosong = picker)
+  9r-claude pick-model            picker fzf/numbered
+  9r-claude edit                  buka config di $EDITOR
+  9r-claude yolo on|off           toggle bypass permission permanen
+
+DEBUG:
+  9r-claude test                  ping endpoint, verify auth
+  HERMES_VERBOSE=1 9r-claude      print endpoint+model sebelum exec
+
+ENV:
+  HERMES_VERBOSE=1                print info wrapper sebelum exec
+  HERMES_YOLO=1                   auto-accept permission utk run ini
+  XDG_CONFIG_HOME                 override $HOME/.config
+
+CONFIG FILE:
+  ~/.config/9r-claude/config      key-value bash (chmod 600)
+
+CONTOH GANTI ENDPOINT/KEY/MODEL:
+  9r-claude set-endpoint http://127.0.0.1:20128
+  9r-claude set-key sk-xxxxxxxxxxxxxxxx
+  9r-claude set-model kr/claude-sonnet-4.5
+  9r-claude pick-model            # picker interaktif
+  9r-claude yolo on               # bypass permission permanen
+
+USAGE
+}
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/9r-claude"
+CONFIG_FILE="$CONFIG_DIR/config"
+LEGACY_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hermes-claude"
+LEGACY_CONFIG_FILE="$LEGACY_CONFIG_DIR/config"
+DEFAULT_ENDPOINT="https://9r.zesbe.my.id"
+DEFAULT_MODEL="kr/claude-opus-4.7-thinking"
+# Per-tier defaults — dipakai sama Claude Code /model picker via
+# ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL. Bisa di-override di
+# config file: HERMES_OPUS_MODEL, HERMES_SONNET_MODEL, HERMES_HAIKU_MODEL.
+DEFAULT_OPUS_MODEL="kr/claude-opus-4.7-thinking"
+DEFAULT_SONNET_MODEL="kr/claude-sonnet-4.6-thinking"
+DEFAULT_HAIKU_MODEL="kr/claude-haiku-4.5"
+
+c_red()    { printf '\033[31m%s\033[0m' "$*"; }
+c_green()  { printf '\033[32m%s\033[0m' "$*"; }
+c_yellow() { printf '\033[33m%s\033[0m' "$*"; }
+c_dim()    { printf '\033[2m%s\033[0m' "$*"; }
+
+die()  { echo "$(c_red "error:") $*" >&2; exit 1; }
+info() { echo "$(c_green "==>") $*" >&2; }
+warn() { echo "$(c_yellow "warn:") $*" >&2; }
+
+mask() {
+  local k="$1"
+  local n=${#k}
+  if [ "$n" -le 12 ]; then echo "***"; return; fi
+  echo "${k:0:6}...${k: -4}"
+}
+
+ensure_config_dir() {
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+}
+
+# Migrate config lama dari ~/.config/hermes-claude → ~/.config/9r-claude.
+# Idempotent: cuma jalan kalau target belum ada tapi legacy ada.
+migrate_legacy_config() {
+  if [ ! -f "$CONFIG_FILE" ] && [ -f "$LEGACY_CONFIG_FILE" ]; then
+    ensure_config_dir
+    cp -p "$LEGACY_CONFIG_FILE" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    info "config lama dari $LEGACY_CONFIG_FILE dipindah ke $CONFIG_FILE"
+  fi
+}
+
+write_config() {
+  ensure_config_dir
+  # Normalize endpoint: strip trailing slash & /v1 suffix biar canonical.
+  # Logic /v1 append-nya ada di cmd_test (Anthropic /v1/messages) dan
+  # cmd_run handle Claude Code base URL tanpa /v1.
+  HERMES_ENDPOINT="${HERMES_ENDPOINT%/}"
+  HERMES_ENDPOINT="${HERMES_ENDPOINT%/v1}"
+  umask 077
+  cat > "$CONFIG_FILE" <<EOF
+# 9r-claude config — auto-generated, edit jika perlu.
+HERMES_ENDPOINT="$HERMES_ENDPOINT"
+HERMES_API_KEY="$HERMES_API_KEY"
+HERMES_MODEL="$HERMES_MODEL"
+HERMES_YOLO="${HERMES_YOLO:-0}"
+EOF
+  chmod 600 "$CONFIG_FILE"
+}
+
+load_config() {
+  HERMES_ENDPOINT=""
+  HERMES_API_KEY=""
+  HERMES_MODEL=""
+  HERMES_YOLO="${HERMES_YOLO:-}"
+  migrate_legacy_config
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+}
+
+prompt_config() {
+  ensure_config_dir
+  local endpoint key model
+  read -r -p "Endpoint base URL [$DEFAULT_ENDPOINT]: " endpoint
+  endpoint="${endpoint:-$DEFAULT_ENDPOINT}"
+  endpoint="${endpoint%/}"  # strip trailing slash
+
+  # baca API key tanpa echo
+  printf "API key (sk-...): "
+  stty -echo
+  read -r key
+  stty echo
+  printf "\n"
+  [ -n "$key" ] || die "API key wajib diisi"
+
+  HERMES_ENDPOINT="$endpoint"
+  HERMES_API_KEY="$key"
+
+  # Coba auto-pick model dari /v1/models. Kalau endpoint nggak balikin
+  # daftar (offline / 404), fallback ke ketik manual.
+  echo ""
+  info "ngambil daftar model dari $endpoint ..."
+  local picked=""
+  if picked=$(pick_model_interactive 2>&1); then
+    HERMES_MODEL="$picked"
+  else
+    warn "gagal fetch /v1/models otomatis"
+    read -r -p "Default model [$DEFAULT_MODEL]: " model
+    HERMES_MODEL="${model:-$DEFAULT_MODEL}"
+  fi
+
+  write_config
+  info "config disimpan di $CONFIG_FILE"
+  info "model aktif: $HERMES_MODEL"
+}
+
+cmd_show() {
+  load_config
+  [ -n "${HERMES_ENDPOINT:-}" ] || die "belum dikonfigurasi. Jalankan: 9r-claude config"
+  local yolo_state="off"
+  [ "${HERMES_YOLO:-0}" = "1" ] && yolo_state="$(c_yellow on) (--dangerously-skip-permissions)"
+  printf "  %-12s %s\n" "endpoint"  "$HERMES_ENDPOINT"
+  printf "  %-12s %s\n" "api key"   "$(mask "$HERMES_API_KEY")"
+  printf "  %-12s %s\n" "model"     "$HERMES_MODEL"
+  printf "  %-12s %s\n" "opus"      "${HERMES_OPUS_MODEL:-$DEFAULT_OPUS_MODEL} $(c_dim '(default)')"
+  printf "  %-12s %s\n" "sonnet"    "${HERMES_SONNET_MODEL:-$DEFAULT_SONNET_MODEL} $(c_dim '(default)')"
+  printf "  %-12s %s\n" "haiku"     "${HERMES_HAIKU_MODEL:-$DEFAULT_HAIKU_MODEL} $(c_dim '(default)')"
+  printf "  %-12s %s\n" "yolo"      "$yolo_state"
+  printf "  %-12s %s\n" "config"    "$CONFIG_FILE"
+}
+
+cmd_version() {
+  echo "9r-claude $VERSION"
+}
+
+cmd_yolo() {
+  load_config
+  : "${HERMES_ENDPOINT:=$DEFAULT_ENDPOINT}"
+  : "${HERMES_API_KEY:=}"
+  : "${HERMES_MODEL:=$DEFAULT_MODEL}"
+  case "${1:-}" in
+    on|enable|true|1)
+      HERMES_YOLO=1
+      write_config
+      info "yolo mode: $(c_yellow ON) — claude akan dijalankan dgn --dangerously-skip-permissions"
+      ;;
+    off|disable|false|0|"")
+      HERMES_YOLO=0
+      write_config
+      info "yolo mode: $(c_green OFF) — permission prompt normal"
+      ;;
+    status)
+      if [ "${HERMES_YOLO:-0}" = "1" ]; then echo "yolo: on"; else echo "yolo: off"; fi
+      ;;
+    *)
+      die "usage: 9r-claude yolo [on|off|status]"
+      ;;
+  esac
+}
+
+cmd_edit() {
+  ensure_config_dir
+  : > "$CONFIG_FILE.lock"  # ensure exists, no-op if already
+  rm -f "$CONFIG_FILE.lock"
+  [ -f "$CONFIG_FILE" ] || die "belum ada config. Jalankan: 9r-claude config"
+  local editor="${EDITOR:-${VISUAL:-nano}}"
+  command -v "$editor" >/dev/null || die "editor '$editor' tidak ditemukan (set \$EDITOR)"
+  "$editor" "$CONFIG_FILE"
+}
+
+cmd_set_endpoint() {
+  [ -n "${1:-}" ] || die "usage: 9r-claude set-endpoint <url>"
+  load_config
+  HERMES_ENDPOINT="${1%/}"
+  : "${HERMES_API_KEY:=}"
+  : "${HERMES_MODEL:=$DEFAULT_MODEL}"
+  write_config
+  info "endpoint -> $HERMES_ENDPOINT"
+}
+
+cmd_set_key() {
+  [ -n "${1:-}" ] || die "usage: 9r-claude set-key <key>"
+  load_config
+  HERMES_API_KEY="$1"
+  : "${HERMES_ENDPOINT:=$DEFAULT_ENDPOINT}"
+  : "${HERMES_MODEL:=$DEFAULT_MODEL}"
+  write_config
+  info "api key updated -> $(mask "$HERMES_API_KEY")"
+}
+
+cmd_set_model() {
+  load_config
+  : "${HERMES_ENDPOINT:=$DEFAULT_ENDPOINT}"
+  : "${HERMES_API_KEY:=}"
+  if [ -n "${1:-}" ]; then
+    HERMES_MODEL="$1"
+  else
+    [ -n "$HERMES_API_KEY" ] || die "set api key dulu: 9r-claude set-key <key>"
+    HERMES_MODEL=$(pick_model_interactive) || die "tidak ada model dipilih"
+  fi
+  write_config
+  info "model -> $HERMES_MODEL"
+}
+
+# Fetch model IDs dari endpoint OpenAI-compat /v1/models.
+# Output: satu model per baris ke stdout.
+fetch_models() {
+  local endpoint="${1:-$HERMES_ENDPOINT}"
+  local key="${2:-$HERMES_API_KEY}"
+  [ -n "$endpoint" ] && [ -n "$key" ] || return 1
+  curl -s --max-time 15 "$endpoint/v1/models" \
+    -H "Authorization: Bearer $key" \
+    | (
+        if command -v jq >/dev/null; then
+          jq -r '.data[]?.id // empty' 2>/dev/null
+        else
+          grep -oE '"id":"[^"]+"' | sed -E 's/"id":"([^"]+)"/\1/'
+        fi
+      )
+}
+
+# Interactive picker. fzf kalau ada, fallback ke menu nomor.
+# Stdout: id model terpilih.
+pick_model_interactive() {
+  local models
+  models=$(fetch_models) || die "gagal fetch /v1/models dari $HERMES_ENDPOINT"
+  [ -n "$models" ] || die "endpoint tidak return model apa-apa (cek api key)"
+
+  local current="${HERMES_MODEL:-}"
+  local count
+  count=$(echo "$models" | wc -l)
+
+  if command -v fzf >/dev/null; then
+    local picked
+    picked=$(echo "$models" | fzf \
+      --prompt="Pilih model > " \
+      --height=70% --reverse --border \
+      --header="$count model tersedia di $HERMES_ENDPOINT (Enter pilih, Esc batal)" \
+      --query="$current" \
+      --no-multi)
+    [ -n "$picked" ] || return 1
+    echo "$picked"
+    return 0
+  fi
+
+  # Fallback: numbered menu
+  echo "" >&2
+  echo "$count model tersedia di $HERMES_ENDPOINT:" >&2
+  echo "" >&2
+  local i=1
+  declare -a list=()
+  while IFS= read -r m; do
+    list+=("$m")
+    local marker=""
+    [ "$m" = "$current" ] && marker=" $(c_green '(current)')"
+    printf "  %3d) %s%s\n" "$i" "$m" "$marker" >&2
+    i=$((i+1))
+  done <<<"$models"
+  echo "" >&2
+  local choice
+  read -r -p "Pilih nomor (Enter = batal): " choice
+  [ -n "$choice" ] || return 1
+  [[ "$choice" =~ ^[0-9]+$ ]] || die "input bukan angka"
+  [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ] || die "nomor di luar range"
+  echo "${list[$((choice-1))]}"
+}
+
+cmd_models() {
+  load_config
+  [ -n "${HERMES_ENDPOINT:-}" ] && [ -n "${HERMES_API_KEY:-}" ] \
+    || die "config belum lengkap. Jalankan: 9r-claude config"
+  local models
+  models=$(fetch_models) || die "gagal fetch /v1/models"
+  [ -n "$models" ] || die "endpoint kosong"
+  local count
+  count=$(echo "$models" | wc -l)
+  echo "$count model di $HERMES_ENDPOINT:"
+  echo "$models" | while IFS= read -r m; do
+    if [ "$m" = "${HERMES_MODEL:-}" ]; then
+      echo "  * $m  $(c_green '(current)')"
+    else
+      echo "    $m"
+    fi
+  done
+}
+
+cmd_pick_model() {
+  load_config
+  [ -n "${HERMES_ENDPOINT:-}" ] && [ -n "${HERMES_API_KEY:-}" ] \
+    || die "config belum lengkap. Jalankan: 9r-claude config"
+  local picked
+  picked=$(pick_model_interactive) || die "tidak ada model dipilih"
+  HERMES_MODEL="$picked"
+  write_config
+  info "model -> $HERMES_MODEL"
+}
+
+cmd_reset() {
+  if [ ! -f "$CONFIG_FILE" ]; then
+    info "tidak ada config untuk dihapus"
+    return 0
+  fi
+  local ans
+  read -r -p "Hapus $CONFIG_FILE? [y/N]: " ans
+  case "$ans" in
+    y|Y|yes|YES)
+      rm -f "$CONFIG_FILE"
+      info "config dihapus"
+      ;;
+    *)
+      info "dibatalkan"
+      ;;
+  esac
+}
+
+cmd_test() {
+  load_config
+  [ -n "${HERMES_ENDPOINT:-}" ] && [ -n "${HERMES_API_KEY:-}" ] \
+    || die "config belum lengkap. Jalankan: 9r-claude config"
+  info "ping $HERMES_ENDPOINT/v1/messages ..."
+  local code
+  code=$(curl -s -o /tmp/9r-claude-test.$$ -w '%{http_code}' --max-time 20 \
+    -X POST "$HERMES_ENDPOINT/v1/messages" \
+    -H "x-api-key: $HERMES_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "{\"model\":\"$HERMES_MODEL\",\"max_tokens\":20,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"say hi in 3 words\"}]}")
+  echo "HTTP $code"
+  if [ "$code" = "200" ]; then
+    if command -v jq >/dev/null; then
+      jq -r '.content[0].text // .content // .' /tmp/9r-claude-test.$$ 2>/dev/null || cat /tmp/9r-claude-test.$$
+    else
+      head -c 400 /tmp/9r-claude-test.$$; echo
+    fi
+  else
+    head -c 400 /tmp/9r-claude-test.$$; echo
+  fi
+  rm -f /tmp/9r-claude-test.$$
+}
+
+cmd_run() {
+  load_config
+  if [ -z "${HERMES_ENDPOINT:-}" ] || [ -z "${HERMES_API_KEY:-}" ]; then
+    warn "config belum ada — masuk mode setup interaktif"
+    prompt_config
+    load_config
+  fi
+  command -v claude >/dev/null \
+    || die "binary 'claude' (Claude Code CLI) tidak ditemukan di PATH"
+
+  # PENTING: Claude Code complain "Auth conflict" kalau ANTHROPIC_API_KEY
+  # juga ke-set bareng ANTHROPIC_AUTH_TOKEN — dia bakal fallback ke akun
+  # Anthropic resmi (kalau user pernah login) bukan endpoint kita.
+  # Untuk custom base URL (9router/proxy), pakai HANYA ANTHROPIC_AUTH_TOKEN.
+  unset ANTHROPIC_API_KEY
+
+  # Claude Code Anthropic-compat: BASE_URL TANPA /v1 (dia append sendiri).
+  # Kalau user input endpoint pakai /v1 (kebiasaan OpenAI client), strip dulu.
+  local cc_base="${HERMES_ENDPOINT%/}"
+  cc_base="${cc_base%/v1}"
+
+  export ANTHROPIC_BASE_URL="$cc_base"
+  export ANTHROPIC_AUTH_TOKEN="$HERMES_API_KEY"
+  # Per-tier model mapping ala 9router demo. Claude Code /model picker
+  # mengubah TIER aktif (Opus / Sonnet / Haiku) — yang ke-set ke endpoint
+  # adalah model di tier itu, bukan ANTHROPIC_MODEL global.
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="${HERMES_OPUS_MODEL:-$DEFAULT_OPUS_MODEL}"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="${HERMES_SONNET_MODEL:-$DEFAULT_SONNET_MODEL}"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="${HERMES_HAIKU_MODEL:-$DEFAULT_HAIKU_MODEL}"
+  # Backward-compat: kalau user expect single-model mode, biarin ANTHROPIC_MODEL
+  # juga ke-set — Claude Code prefer DEFAULT_*_MODEL kalau ada keduanya.
+  export ANTHROPIC_MODEL="$HERMES_MODEL"
+  # Small/fast model buat task ringan (compaction, summary). Pakai haiku
+  # supaya hemat & cepat — bukan model utama.
+  export ANTHROPIC_SMALL_FAST_MODEL="${HERMES_HAIKU_MODEL:-$DEFAULT_HAIKU_MODEL}"
+
+  # YOLO mode — auto-accept semua permission Claude Code (ekuivalen
+  # `gemini -y`). DEFAULT ON sejak v0.4 — `9r-claude` aja sudah cukup.
+  # Override priority (tertinggi → terendah):
+  #   1. Flag CLI `--no-yolo` → matikan (sekali jalan).
+  #   2. Flag CLI `-y` / `--yolo` → nyalakan eksplisit (sekali jalan).
+  #   3. Env HERMES_YOLO=0|1 → override per-run.
+  #   4. Config HERMES_YOLO=0 → matikan permanen.
+  #   5. Default: ON.
+  # Kalau user manual pass `--dangerously-skip-permissions`, jangan duplikasi.
+  local yolo_on="1"
+  case "${HERMES_YOLO:-}" in
+    0|off|false|no) yolo_on="0" ;;
+    1|on|true|yes)  yolo_on="1" ;;
+  esac
+  case "${_9R_YOLO_ARG:-}" in
+    0) yolo_on="0" ;;
+    1) yolo_on="1" ;;
+  esac
+  local yolo_flag_added=0
+  if [ "$yolo_on" = "1" ]; then
+    local already=0
+    for arg in "$@"; do
+      case "$arg" in
+        --dangerously-skip-permissions) already=1; break ;;
+      esac
+    done
+    if [ "$already" = "0" ]; then
+      yolo_flag_added=1
+    fi
+  fi
+
+  if [ "${HERMES_VERBOSE:-0}" = "1" ]; then
+    info "endpoint:    $HERMES_ENDPOINT"
+    info "opus model:  $ANTHROPIC_DEFAULT_OPUS_MODEL"
+    info "sonnet:      $ANTHROPIC_DEFAULT_SONNET_MODEL"
+    info "haiku:       $ANTHROPIC_DEFAULT_HAIKU_MODEL"
+    info "key:         $(mask "$HERMES_API_KEY")"
+    if [ "$yolo_on" = "1" ]; then
+      info "yolo:        ON (--dangerously-skip-permissions)"
+    fi
+  fi
+
+  if [ "$yolo_flag_added" = "1" ]; then
+    exec claude --dangerously-skip-permissions "$@"
+  fi
+  exec claude "$@"
+}
+
+main() {
+  # Strip -y / --yolo / --no-yolo dari argumen sebelum dispatch — flag ini
+  # untuk wrapper, bukan claude. Stash hasilnya ke _9R_YOLO_ARG:
+  #   "1"  → user pass -y / --yolo (force on)
+  #   "0"  → user pass --no-yolo  (force off)
+  #   ""   → no flag (pakai config/env/default)
+  _9R_YOLO_ARG=""
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      -y|--yolo)    _9R_YOLO_ARG=1 ;;
+      --no-yolo)    _9R_YOLO_ARG=0 ;;
+      *)            args+=("$a") ;;
+    esac
+  done
+  set -- "${args[@]:-}"
+  # Re-empty kalau awalnya kosong (bash quirk untuk array kosong + set --).
+  if [ "${#args[@]}" -eq 0 ]; then set --; fi
+
+  case "${1:-}" in
+    show|status)         shift; cmd_show ;;
+    config|init|setup)   shift; prompt_config ;;
+    set-endpoint)        shift; cmd_set_endpoint "${1:-}" ;;
+    set-key)             shift; cmd_set_key "${1:-}" ;;
+    set-model)           shift; cmd_set_model "${1:-}" ;;
+    models|list-models)  shift; cmd_models ;;
+    pick-model|pick)     shift; cmd_pick_model ;;
+    edit)                shift; cmd_edit ;;
+    reset)               shift; cmd_reset ;;
+    test|ping)           shift; cmd_test ;;
+    yolo)                shift; cmd_yolo "${1:-}" ;;
+    version|--version|-V) cmd_version ;;
+    --help|-h|help)      usage ;;
+    --) shift; cmd_run "$@" ;;
+    *)  cmd_run "$@" ;;
+  esac
+}
+
+main "$@"

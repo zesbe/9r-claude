@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — one-liner installer untuk hermes-claude
+# install.sh — one-liner installer untuk 9r-claude
 #
 # Quick install:
 #   curl -fsSL https://raw.githubusercontent.com/zesbe/hermes-claude/main/scripts/install.sh | bash
@@ -15,7 +15,9 @@ PREFIX="${PREFIX:-$HOME/.local}"
 BINDIR="$PREFIX/bin"
 RAW="https://raw.githubusercontent.com/$REPO/$BRANCH"
 
-BINS=(hermes-claude kiro2claude kiro2claude-summary kiro-compact)
+PRIMARY="9r-claude"
+LEGACY="hermes-claude"
+EXTRA=(kiro2claude kiro2claude-summary kiro-compact)
 
 c_green() { printf '\033[32m%s\033[0m' "$*"; }
 c_red()   { printf '\033[31m%s\033[0m' "$*"; }
@@ -31,7 +33,25 @@ command -v claude >/dev/null || warn "claude (Claude Code CLI) not found in PATH
 mkdir -p "$BINDIR"
 
 info "downloading from $REPO@$BRANCH"
-for b in "${BINS[@]}"; do
+
+# Primary binary
+url="$RAW/bin/$PRIMARY"
+dst="$BINDIR/$PRIMARY"
+if curl -fsSL --max-time 30 "$url" -o "$dst.tmp"; then
+  chmod +x "$dst.tmp"
+  mv "$dst.tmp" "$dst"
+  echo "  $(c_green '✓') $dst"
+else
+  rm -f "$dst.tmp"
+  die "gagal download $url"
+fi
+
+# Legacy alias as symlink
+ln -sf "$PRIMARY" "$BINDIR/$LEGACY"
+echo "  $(c_green '✓') $BINDIR/$LEGACY $(c_dim '-> '"$PRIMARY")"
+
+# Bridge tools
+for b in "${EXTRA[@]}"; do
   url="$RAW/bin/$b"
   dst="$BINDIR/$b"
   if curl -fsSL --max-time 30 "$url" -o "$dst.tmp"; then
@@ -40,7 +60,7 @@ for b in "${BINS[@]}"; do
     echo "  $(c_green '✓') $dst"
   else
     rm -f "$dst.tmp"
-    die "gagal download $url"
+    warn "gagal download $url (skip)"
   fi
 done
 
@@ -53,8 +73,8 @@ fi
 info "$(c_green 'install selesai')"
 echo ""
 echo "  Next:"
-echo "    $(c_dim 1.) hermes-claude config"
-echo "    $(c_dim 2.) hermes-claude test"
-echo "    $(c_dim 3.) hermes-claude"
+echo "    $(c_dim 1.) 9r-claude config"
+echo "    $(c_dim 2.) 9r-claude test"
+echo "    $(c_dim 3.) 9r-claude         $(c_dim '# yolo default ON sejak v0.4')"
 echo ""
 echo "  Docs: https://github.com/$REPO"
