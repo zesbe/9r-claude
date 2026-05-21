@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""kiro-compact — fork a Kiro session into a fresh one via summary handoff.
+
+Solves the "long Kiro session keeps hitting rate limit" problem.
+Pakai logika sama kayak kiro2claude-summary, tapi launch ulang ke Kiro
+(bukan Claude). Sesi baru ke-start dengan ringkasan + transkrip turn
+terakhir sebagai opening message — Kiro lanjut tanpa beban context lama.
+
+Usage:
+  kiro-compact                    compact most recent session, launch new kiro
+  kiro-compact <session-id>       compact specific session
+  kiro-compact --print            print summary saja, gak launch
+  kiro-compact --save FILE        save summary ke file
+  kiro-compact --last N           keep last N turns verbatim (default: 30)
+"""
+from __future__ import annotations
+import argparse, json, os, shutil, sys
+from pathlib import Path
+
+
+def extract_turns(src):
+    """Walk Kiro JSONL, return ordered list of (kind, payload)."""
+    turns = []
+    with open(src) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = d.get("kind")
+            data = d.get("data", {}) or {}
+
+            if kind == "Prompt":
+                texts = [c.get("data", "") for c in data.get("content", [])
+                         if c.get("kind") == "text"]
+                txt = "\n".join(t for t in texts if t).strip()
+                if txt:
+                    turns.append(("user", txt))
+
+            elif kind == "AssistantMessage":
+                text_parts, tools = [], []
+                for c in data.get("content", []):
+                    ck = c.get("kind")
+                    cd = c.get("data")
+                    if ck == "text":
+                        t = cd if isinstance(cd, str) else (cd or {}).get("text", "")
+                        if t:
+                            text_parts.append(t)
+                    elif ck == "toolUse":
+                        tu = cd or {}
+                        name = tu.get("name", "?")
+                        inp = tu.get("input") or {}
+                        clean = {k: v for k, v in inp.items() if k != "__tool_use_purpose"}
+                        if name == "shell" and "command" in clean:
+                            tools.append(f"$ {str(clean['command'])[:120]}")
+                        elif name in ("web_fetch", "webFetch") and "url" in clean:
+                            tools.append(f"fetch: {clean['url']}")
+                        elif "path" in clean:
+                            tools.append(f"{name}: {clean['path']}")
+                        else:
+                            tools.append(f"{name}: {json.dumps(clean, ensure_ascii=False)[:80]}")
+                txt = "\n".join(text_parts).strip()
+                if txt:
+                    turns.append(("asst", txt))
+                if tools:
+                    turns.append(("tool", " | ".join(tools[:3])))
+
+            elif kind == "Compaction":
+                summary = data.get("summary") or data.get("text") or ""
+                if summary:
+                    turns.append(("asst", f"[prev compaction] {summary[:500]}"))
+    return turns
+
+
+def truncate(s, n):
+    return s if len(s) <= n else s[:n] + f"\n... [+{len(s)-n} chars truncated]"
+
+
+def build_summary(turns, last_n=30):
+    if not turns:
+        return "(empty session)"
+    first_user = next((t for k, t in turns if k == "user"), None)
+    tail = turns[-last_n:] if len(turns) > last_n else turns
+
+    lines = ["# Lanjutan sesi sebelumnya (auto-compact)\n\n"]
+    lines.append(f"Sesi sebelumnya kepanjangan ({len(turns)} turn) — context-nya gua auto-compact ")
+    lines.append(f"jadi ringkasan + transkrip {len(tail)} turn terakhir biar gak kena rate limit terus.\n\n")
+
+    if first_user:
+        lines.append("## Permintaan awal user\n\n```\n")
+        lines.append(truncate(first_user, 1500))
+        lines.append("\n```\n\n")
+
+    lines.append(f"## Transkrip {len(tail)} turn terakhir\n\n")
+    for k, p in tail:
+        if k == "user":
+            lines.append(f"**USER:**\n{truncate(p, 1200)}\n\n")
+        elif k == "asst":
+            lines.append(f"**ASSISTANT:**\n{truncate(p, 2000)}\n\n")
+        elif k == "tool":
+            lines.append(f"_(tools: {truncate(p, 200)})_\n\n")
+
+    lines.append("---\n\nLanjutin dari sini ya, jangan ulang yang udah selesai. ")
+    lines.append("File / state di filesystem kemungkinan masih ada — verify dulu sebelum action.\n")
+    return "".join(lines)
+
+
+def find_latest_session():
+    kiro_dir = Path.home() / ".kiro" / "sessions" / "cli"
+    if not kiro_dir.exists():
+        return None
+    sessions = sorted(kiro_dir.glob("*.jsonl"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    return sessions[0] if sessions else None
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Auto-compact long Kiro session into fresh one",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__)
+    ap.add_argument("session", nargs="?",
+                    help="Kiro session ID (default: most recent)")
+    ap.add_argument("--last", type=int, default=30,
+                    help="last N turns to keep verbatim (default: 30)")
+    ap.add_argument("--print", dest="just_print", action="store_true",
+                    help="print summary only, don't launch kiro")
+    ap.add_argument("--save", help="save summary to FILE")
+    ap.add_argument("--kiro-bin", default=os.environ.get("KIRO_BIN", "kiro-cli"),
+                    help="kiro binary to launch (default: kiro-cli or $KIRO_BIN)")
+    args = ap.parse_args()
+
+    if args.session:
+        src = Path.home() / ".kiro" / "sessions" / "cli" / f"{args.session}.jsonl"
+    else:
+        src = find_latest_session()
+
+    if not src or not src.exists():
+        print(f"error: kiro session not found", file=sys.stderr)
+        return 1
+
+    size_mb = src.stat().st_size / 1024 / 1024
+    print(f"==> compacting: {src.name} ({size_mb:.1f} MB)", file=sys.stderr)
+
+    turns = extract_turns(src)
+    if not turns:
+        print(f"warn: session is empty, nothing to compact", file=sys.stderr)
+        return 1
+
+    summary = build_summary(turns, args.last)
+    print(f"==> summary: {len(summary):,} chars (~{len(summary)//4:,} tokens) "
+          f"from {len(turns)} turns", file=sys.stderr)
+
+    if args.save:
+        Path(args.save).write_text(summary)
+        print(f"==> saved: {args.save}", file=sys.stderr)
+
+    if args.just_print:
+        print(summary)
+        return 0
+
+    # Launch fresh Kiro with summary as opening prompt
+    kiro = args.kiro_bin
+    if not shutil.which(kiro):
+        print(f"warn: '{kiro}' not in PATH — printing summary instead", file=sys.stderr)
+        print(summary)
+        return 0
+
+    print(f"==> launching: {kiro} chat -a", file=sys.stderr)
+    print(f"==> tip: kalau sesi baru udah masuk, lo tinggal lanjut chat normal\n",
+          file=sys.stderr)
+    os.execvp(kiro, [kiro, "chat", "-a", summary])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

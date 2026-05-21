@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""kiro2claude — convert Kiro CLI session JSONL into Claude Code JSONL.
+
+Usage:
+  kiro2claude <kiro-session.jsonl> [--cwd /path] [--out FILE]
+
+Output goes ke ~/.claude/projects/<encoded-cwd>/<new-uuid>.jsonl jadi bisa
+langsung di-/resume dari Claude Code.
+"""
+from __future__ import annotations
+import argparse, json, os, sys, uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def iso(ts: int | float | None) -> str:
+    if ts is None:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def encode_cwd(cwd: str) -> str:
+    # Claude Code project dir naming: replace / with -, leading -
+    return cwd.replace("/", "-")
+
+
+def pad_orphan_tool_uses(records: list[dict]) -> list[dict]:
+    """Anthropic API requires every tool_use to be followed by a matching
+    tool_result in the very next user message. Kiro sessions sometimes get
+    interrupted (user hit Ctrl-C mid-tool, or process crashed) leaving
+    tool_use blocks without results — server then returns 400.
+
+    Walk the record list. For each assistant record containing tool_use
+    blocks, check the next user record. Any tool_use_id without a matching
+    tool_result gets a synthetic stub injected.
+    """
+    fixed: list[dict] = []
+    for i, rec in enumerate(records):
+        fixed.append(rec)
+        if rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message", {})
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        tool_use_ids = [b["id"] for b in content if b.get("type") == "tool_use"]
+        if not tool_use_ids:
+            continue
+
+        # Look at next record — does it contain tool_results?
+        nxt = records[i + 1] if i + 1 < len(records) else None
+        existing_result_ids: set[str] = set()
+        if nxt and nxt.get("type") == "user":
+            ncontent = nxt.get("message", {}).get("content")
+            if isinstance(ncontent, list):
+                existing_result_ids = {
+                    b.get("tool_use_id") for b in ncontent
+                    if b.get("type") == "tool_result"
+                }
+
+        missing = [tid for tid in tool_use_ids if tid not in existing_result_ids]
+        if not missing:
+            continue
+
+        stub_blocks = [{
+            "type": "tool_result",
+            "tool_use_id": tid,
+            "content": "(tool was called but no result was captured — Kiro session interrupted)",
+            "is_error": True,
+        } for tid in missing]
+
+        if nxt and nxt.get("type") == "user" and isinstance(
+                nxt.get("message", {}).get("content"), list):
+            # Merge stubs into existing tool_result user message
+            nxt["message"]["content"] = stub_blocks + nxt["message"]["content"]
+        else:
+            # Insert a fresh stub-only user message right after this assistant
+            base_keys = {k: v for k, v in rec.items()
+                         if k in ("isSidechain", "userType", "entrypoint",
+                                  "cwd", "sessionId", "version", "gitBranch")}
+            stub_rec = {
+                **base_keys,
+                "type": "user",
+                "uuid": str(uuid.uuid4()),
+                "parentUuid": rec.get("uuid"),
+                "timestamp": rec.get("timestamp"),
+                "message": {"role": "user", "content": stub_blocks},
+            }
+            fixed.append(stub_rec)
+            # Re-thread: next real record's parentUuid should now point to stub
+            if nxt is not None:
+                nxt["parentUuid"] = stub_rec["uuid"]
+    return fixed
+
+
+def truncate_to_budget(records: list[dict], max_chars: int) -> list[dict]:
+    """Keep recent records that fit within max_chars budget. Walks from the
+    end, accumulating size, then trims from the start. Ensures the kept slice
+    starts with a 'user' record (Anthropic API requires first msg = user)
+    and doesn't split a tool_use/tool_result pair.
+    """
+    if max_chars <= 0:
+        return records
+
+    # Compute size of each record as serialized JSON
+    sizes = [len(json.dumps(r, ensure_ascii=False)) for r in records]
+    total = sum(sizes)
+    if total <= max_chars:
+        return records
+
+    # Walk from end, accumulate until budget exhausted
+    budget = max_chars
+    keep_from = len(records)
+    for i in range(len(records) - 1, -1, -1):
+        if budget - sizes[i] < 0:
+            break
+        budget -= sizes[i]
+        keep_from = i
+
+    # Move forward until we land on a user record that's NOT a tool_result
+    # (a tool_result without its preceding tool_use is malformed).
+    while keep_from < len(records):
+        r = records[keep_from]
+        if r.get("type") == "user":
+            content = r.get("message", {}).get("content")
+            if isinstance(content, str):
+                break
+            if isinstance(content, list) and not any(
+                    b.get("type") == "tool_result" for b in content):
+                break
+        keep_from += 1
+
+    if keep_from >= len(records):
+        # Couldn't find a clean cut — keep just the very last user message
+        for i in range(len(records) - 1, -1, -1):
+            r = records[i]
+            if r.get("type") == "user":
+                c = r.get("message", {}).get("content")
+                if isinstance(c, str):
+                    return [r]
+        return records[-1:]
+
+    kept = records[keep_from:]
+    # Re-thread parentUuid of first kept record to None (start of conversation)
+    if kept:
+        kept[0] = {**kept[0], "parentUuid": None}
+    return kept
+
+
+def convert(src: Path, cwd: str, out: Path, version: str = "2.1.146",
+            max_chars: int = 0) -> int:
+    session_id = str(uuid.uuid4())
+    parent_uuid: str | None = None
+    base = dict(
+        isSidechain=False,
+        userType="external",
+        entrypoint="cli",
+        cwd=cwd,
+        sessionId=session_id,
+        version=version,
+        gitBranch="",
+    )
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    records: list[dict] = []
+
+    def emit(rec: dict) -> None:
+        nonlocal parent_uuid
+        rec.setdefault("uuid", str(uuid.uuid4()))
+        rec.setdefault("parentUuid", parent_uuid)
+        records.append(rec)
+        parent_uuid = rec["uuid"]
+
+    with src.open() as fin:
+
+        for line in fin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                k = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            kind = k.get("kind")
+            data = k.get("data") or {}
+            ts = iso((data.get("meta") or {}).get("timestamp"))
+
+            if kind == "Prompt":
+                # Kiro prompt (user input)
+                texts = []
+                for c in data.get("content", []):
+                    if c.get("kind") == "text":
+                        texts.append(c.get("data", ""))
+                content = "\n".join(t for t in texts if t)
+                if not content:
+                    continue
+                emit({
+                    **base,
+                    "type": "user",
+                    "promptId": str(uuid.uuid4()),
+                    "message": {"role": "user", "content": content},
+                    "timestamp": ts,
+                })
+
+            elif kind == "AssistantMessage":
+                blocks = []
+                for c in data.get("content", []):
+                    ck = c.get("kind")
+                    cd = c.get("data")
+                    if ck == "text":
+                        txt = cd if isinstance(cd, str) else (cd or {}).get("text", "")
+                        if txt:
+                            blocks.append({"type": "text", "text": txt})
+                    elif ck == "thinking":
+                        # Skip thinking blocks entirely — Kiro signatures were
+                        # signed by the original Anthropic backend session and
+                        # won't validate at a different endpoint (9router relay).
+                        # Including them triggers "400 Invalid JSON body".
+                        continue
+                    elif ck == "toolUse":
+                        tu = cd or {}
+                        inp = tu.get("input") or {}
+                        # strip Kiro-only marker
+                        inp.pop("__tool_use_purpose", None)
+                        blocks.append({
+                            "type": "tool_use",
+                            "id": tu.get("toolUseId") or f"toolu_{uuid.uuid4().hex[:24]}",
+                            "name": tu.get("name", "unknown"),
+                            "input": inp,
+                        })
+                if not blocks:
+                    continue
+                emit({
+                    **base,
+                    "type": "assistant",
+                    "message": {
+                        "id": data.get("message_id") or f"msg_{uuid.uuid4().hex[:24]}",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-opus-4.7-thinking",
+                        "content": blocks,
+                        "stop_reason": "end_turn",
+                        "stop_sequence": None,
+                        "usage": {
+                            "input_tokens": 0, "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0, "output_tokens": 0,
+                        },
+                    },
+                    "timestamp": ts,
+                })
+
+            elif kind == "ToolResults":
+                # Pair tool_result blocks into one user message
+                tr_blocks = []
+                for c in data.get("content", []):
+                    ck = c.get("kind")
+                    cd = c.get("data") or {}
+                    if ck == "toolResult":
+                        # Kiro content can be list of {kind:text,data:str} or similar
+                        result_text = ""
+                        rc = cd.get("content")
+                        if isinstance(rc, list):
+                            parts = []
+                            for r in rc:
+                                if isinstance(r, dict):
+                                    if r.get("kind") == "text" or r.get("type") == "text":
+                                        parts.append(str(r.get("data") or r.get("text") or ""))
+                                    else:
+                                        parts.append(json.dumps(r, ensure_ascii=False))
+                                else:
+                                    parts.append(str(r))
+                            result_text = "\n".join(parts)
+                        elif isinstance(rc, str):
+                            result_text = rc
+                        else:
+                            result_text = json.dumps(rc, ensure_ascii=False) if rc else ""
+                        tr_blocks.append({
+                            "type": "tool_result",
+                            "tool_use_id": cd.get("toolUseId") or "toolu_unknown",
+                            "content": result_text or "(no output)",
+                            "is_error": bool(cd.get("isError")),
+                        })
+                if not tr_blocks:
+                    continue
+                emit({
+                    **base,
+                    "type": "user",
+                    "message": {"role": "user", "content": tr_blocks},
+                    "timestamp": ts,
+                })
+
+            elif kind == "Compaction":
+                # Kiro pre-summarized. Inject as a system-style user note.
+                summary = (data.get("summary") or data.get("text") or
+                           json.dumps(data, ensure_ascii=False))[:8000]
+                emit({
+                    **base,
+                    "type": "user",
+                    "isMeta": True,
+                    "message": {"role": "user",
+                                "content": f"<compaction-summary>\n{summary}\n</compaction-summary>"},
+                    "timestamp": ts,
+                })
+
+    # Pad orphan tool_use blocks before truncation
+    records = pad_orphan_tool_uses(records)
+
+    # Truncate to budget if requested (keeps recent records that fit)
+    if max_chars > 0:
+        before = len(records)
+        records = truncate_to_budget(records, max_chars)
+        if len(records) < before:
+            print(f"truncated {before} -> {len(records)} records to fit {max_chars:,} char budget",
+                  file=sys.stderr)
+            # Re-pad after truncation in case a tool_use at the new start lost its result
+            records = pad_orphan_tool_uses(records)
+
+    # Write header + records + footer
+    written = 0
+    with out.open("w") as fout:
+        fout.write(json.dumps({"type": "agent-setting",
+                                "agentSetting": "proactive-mode",
+                                "sessionId": session_id}) + "\n")
+        fout.write(json.dumps({"type": "permission-mode",
+                                "permissionMode": "default",
+                                "sessionId": session_id}) + "\n")
+        for rec in records:
+            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            written += 1
+        # last-prompt record (helps Claude /resume picker show it)
+        if records:
+            fout.write(json.dumps({"type": "last-prompt",
+                                    "lastPrompt": "(imported from Kiro)",
+                                    "leafUuid": records[-1]["uuid"],
+                                    "sessionId": session_id}) + "\n")
+
+    return written
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("src", help="Kiro session .jsonl path")
+    ap.add_argument("--cwd", default=os.path.expanduser("~"),
+                    help="cwd to embed in records (default: $HOME)")
+    ap.add_argument("--out", help="output path (default: ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl)")
+    ap.add_argument("--max-chars", type=int, default=2_000_000,
+                    help="char budget for truncation (default: 2,000,000 ≈ 500k tokens; "
+                         "0 = no truncation)")
+    args = ap.parse_args()
+
+    src = Path(args.src).expanduser()
+    if not src.exists():
+        print(f"error: {src} not found", file=sys.stderr)
+        return 1
+
+    if args.out:
+        out = Path(args.out).expanduser()
+    else:
+        proj_dir = Path.home() / ".claude" / "projects" / encode_cwd(args.cwd)
+        out = proj_dir / f"{uuid.uuid4()}.jsonl"
+
+    n = convert(src, args.cwd, out, max_chars=args.max_chars)
+    print(f"converted {n} records → {out}")
+    print(f"resume in claude: cd {args.cwd} && claude --resume")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

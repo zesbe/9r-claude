@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""kiro2claude-summary — extract a Kiro CLI session into a single-prompt
+Claude Code session that lo bisa --resume.
+
+Daripada replay full history (yang ngelawan token limit + tool ID match +
+signature validation), kita extract konteks penting jadi satu user message
+besar yang berisi: first prompt, turn-by-turn condensed transcript, file/
+URL yang sempat disentuh. Claude Code lalu treat ini sebagai konteks baru
+yang utuh, bisa dilanjutin tanpa drama.
+
+Usage:
+  kiro2claude-summary <kiro-session.jsonl> [--cwd PATH] [--last N]
+"""
+from __future__ import annotations
+import argparse, json, os, sys, uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def iso(ts=None):
+    if ts is None:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def encode_cwd(cwd):
+    return cwd.replace("/", "-")
+
+
+def extract_turns(src):
+    """Walk Kiro JSONL, return ordered list of (kind, payload) turns:
+       ('user', text), ('asst', text), ('tool', summary_str)."""
+    turns = []
+    with open(src) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = d.get("kind")
+            data = d.get("data", {}) or {}
+
+            if kind == "Prompt":
+                texts = [c.get("data", "") for c in data.get("content", [])
+                         if c.get("kind") == "text"]
+                txt = "\n".join(t for t in texts if t).strip()
+                if txt:
+                    turns.append(("user", txt))
+
+            elif kind == "AssistantMessage":
+                text_parts = []
+                tool_summary = []
+                for c in data.get("content", []):
+                    ck = c.get("kind")
+                    cd = c.get("data")
+                    if ck == "text":
+                        t = cd if isinstance(cd, str) else (cd or {}).get("text", "")
+                        if t:
+                            text_parts.append(t)
+                    elif ck == "toolUse":
+                        tu = cd or {}
+                        name = tu.get("name", "?")
+                        inp = tu.get("input") or {}
+                        # Compact tool input description
+                        purpose = inp.get("__tool_use_purpose", "")
+                        clean_inp = {k: v for k, v in inp.items()
+                                     if k != "__tool_use_purpose"}
+                        # Pick the most identifying field
+                        if name == "shell" and "command" in clean_inp:
+                            cmd = str(clean_inp["command"])[:120]
+                            tool_summary.append(f"$ {cmd}")
+                        elif name in ("web_fetch", "webFetch") and "url" in clean_inp:
+                            tool_summary.append(f"fetch: {clean_inp['url']}")
+                        elif "path" in clean_inp:
+                            tool_summary.append(f"{name}: {clean_inp['path']}")
+                        elif "pattern" in clean_inp:
+                            tool_summary.append(f"{name}: {clean_inp['pattern']}")
+                        else:
+                            short = json.dumps(clean_inp, ensure_ascii=False)[:80]
+                            tool_summary.append(f"{name}: {short}")
+                txt = "\n".join(text_parts).strip()
+                if txt:
+                    turns.append(("asst", txt))
+                if tool_summary:
+                    turns.append(("tool", " | ".join(tool_summary[:3])))
+
+            elif kind == "Compaction":
+                summary = data.get("summary") or data.get("text") or ""
+                if summary:
+                    turns.append(("asst", f"[compaction] {summary[:500]}"))
+    return turns
+
+
+def truncate_text(s, limit):
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"\n... [truncated, +{len(s) - limit} chars]"
+
+
+def build_summary(turns, last_n):
+    """Build a readable markdown summary from extracted turns.
+    Keeps the first user prompt verbatim + last N turns condensed."""
+    if not turns:
+        return "(empty session)"
+
+    first_user = next((t for k, t in turns if k == "user"), None)
+
+    # Take the tail
+    tail = turns[-last_n:] if len(turns) > last_n else turns
+
+    lines = []
+    lines.append("# Konteks dari sesi Kiro sebelumnya\n")
+    lines.append(f"Session ini hasil import dari Kiro CLI. Total {len(turns)} turn, ")
+    lines.append(f"di bawah ini ringkasan + transkrip {len(tail)} turn terakhir.\n\n")
+
+    if first_user:
+        lines.append("## Permintaan awal user\n")
+        lines.append("```\n")
+        lines.append(truncate_text(first_user, 2000))
+        lines.append("\n```\n\n")
+
+    lines.append(f"## Transkrip {len(tail)} turn terakhir\n\n")
+    for kind, payload in tail:
+        if kind == "user":
+            lines.append("**USER:**\n")
+            lines.append(truncate_text(payload, 1500))
+            lines.append("\n\n")
+        elif kind == "asst":
+            lines.append("**ASSISTANT:**\n")
+            lines.append(truncate_text(payload, 2500))
+            lines.append("\n\n")
+        elif kind == "tool":
+            lines.append(f"_(tool calls: {truncate_text(payload, 300)})_\n\n")
+
+    lines.append("---\n\n")
+    lines.append("Lanjutin dari sini ya. Konteks file/repo yang dipakai sebelumnya ")
+    lines.append("kemungkinan masih ada di filesystem — verify dulu sebelum action.\n")
+
+    return "".join(lines)
+
+
+def write_session(out_path, cwd, summary_text, version="2.1.146", session_id=None):
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    base = {
+        "isSidechain": False,
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": cwd,
+        "sessionId": session_id,
+        "version": version,
+        "gitBranch": "",
+    }
+    user_uuid = str(uuid.uuid4())
+    asst_uuid = str(uuid.uuid4())
+    now = iso()
+
+    user_rec = {
+        **base,
+        "type": "user",
+        "uuid": user_uuid,
+        "parentUuid": None,
+        "promptId": str(uuid.uuid4()),
+        "timestamp": now,
+        "message": {"role": "user", "content": summary_text},
+    }
+    # Synthetic acknowledgment so /resume picker has a clean turn boundary
+    asst_rec = {
+        **base,
+        "type": "assistant",
+        "uuid": asst_uuid,
+        "parentUuid": user_uuid,
+        "timestamp": now,
+        "message": {
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4.7-thinking",
+            "content": [{
+                "type": "text",
+                "text": ("Konteks Kiro session udah masuk. Siap lanjut. "
+                         "Apa yang mau dikerjain berikutnya?"),
+            }],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": 0, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0, "output_tokens": 0,
+            },
+        },
+    }
+
+    with out_path.open("w") as f:
+        f.write(json.dumps({"type": "agent-setting",
+                            "agentSetting": "proactive-mode",
+                            "sessionId": session_id}) + "\n")
+        f.write(json.dumps({"type": "permission-mode",
+                            "permissionMode": "default",
+                            "sessionId": session_id}) + "\n")
+        f.write(json.dumps(user_rec, ensure_ascii=False) + "\n")
+        f.write(json.dumps(asst_rec, ensure_ascii=False) + "\n")
+        f.write(json.dumps({"type": "last-prompt",
+                            "lastPrompt": "(imported from Kiro — summary)",
+                            "leafUuid": asst_uuid,
+                            "sessionId": session_id}) + "\n")
+    return session_id
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("src", help="Kiro session .jsonl")
+    ap.add_argument("--cwd", default=os.path.expanduser("~"))
+    ap.add_argument("--last", type=int, default=40,
+                    help="how many last turns to include verbatim (default: 40)")
+    ap.add_argument("--out", help="output path (default: ~/.claude/projects/...)")
+    args = ap.parse_args()
+
+    src = Path(args.src).expanduser()
+    if not src.exists():
+        print(f"error: {src} not found", file=sys.stderr)
+        return 1
+
+    turns = extract_turns(src)
+    summary = build_summary(turns, args.last)
+
+    # Claude Code uses the FILENAME (without .jsonl) as the session ID for
+    # --resume, NOT the sessionId field inside the records. So generate the
+    # UUID once and use it as both filename and session_id.
+    sid_uuid = str(uuid.uuid4())
+    if args.out:
+        out = Path(args.out).expanduser()
+    else:
+        proj = Path.home() / ".claude" / "projects" / encode_cwd(args.cwd)
+        out = proj / f"{sid_uuid}.jsonl"
+
+    sid = write_session(out, args.cwd, summary, session_id=sid_uuid)
+    print(f"summary: {len(summary):,} chars (~{len(summary)//4:,} tokens)")
+    print(f"turns extracted: {len(turns)}, last {args.last} kept verbatim")
+    print(f"session: {sid}")
+    print(f"file:    {out}")
+    print(f"\nresume:  cd {args.cwd} && hermes-claude --resume {sid}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
